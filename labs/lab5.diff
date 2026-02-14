@@ -1,5 +1,5 @@
 diff --git a/kernels/starter_code/all_techniques.cc b/kernels/starter_code/all_techniques.cc
-index c902e7e..903025c 100644
+index c902e7e..3dbef24 100644
 --- a/kernels/starter_code/all_techniques.cc
 +++ b/kernels/starter_code/all_techniques.cc
 @@ -7,7 +7,7 @@
@@ -11,44 +11,100 @@ index c902e7e..903025c 100644
  #ifdef QM_ARM
  #include <arm_neon.h>
  #endif
-@@ -125,7 +125,11 @@ static void *all_techniques_worker_func(void *args) {
-                 // (3) use _mm256_srli_epi16 and _mm256_and_si256 with lowMask to extract the upper half of weights
+@@ -114,26 +114,21 @@ static void *all_techniques_worker_func(void *args) {
+             const __m256i *w_start = (__m256i *)&B->int4_data_ptr[col * k / 2];
+             const __m256i *a_start = (__m256i *)&A->int8_data_ptr[row * k];
+             const int num_block = k / block_size;
++            // Precompute constants outside loop
++            const __m256i lowMask = _mm256_set1_epi8(0xF);
++            const __m256i zero_point = _mm256_set1_epi8(8);
++            const __m256i ones = _mm256_set1_epi16(1);
+             // Compute four blocks = 128 4-bit weights in each iteration
+             for (int q = 0; q < num_block; q += 4) {
+-                // lowbit mask
+-                const __m256i lowMask = _mm256_set1_epi8(0xF);
+ 
+-                // TODO: Unpack 128 4-bit (two __mm256i) weights into 128 8-bit (four __mm256i)
+-                // (1) load 256 bit from w_strat with _mm256_loadu_si256
+-                // (2) use _mm256_and_si256 and lowMask to extract the lower half of wegihts
+-                // (3) use _mm256_srli_epi16 and _mm256_and_si256 with lowMask to extract the upper half of weights
++                // Unpack 128 4-bit weights and dequantize
                  __m256i raw_w = _mm256_loadu_si256(w_start);
                  __m256i raw_w_next = _mm256_loadu_si256(w_start + 1);
 -
-+                __m256i w_low = _mm256_and_si256(raw_w, lowMask);
-+                __m256i w_low_next = _mm256_and_si256(raw_w_next, lowMask);
-+                //_mm256_srli_epi16 each 16bits shifted to right 4 bits, then use lowMask to do the AND operation to get the upper half weights. 
-+                __m256i w_high = _mm256_and_si256(_mm256_srli_epi16(raw_w, 4), lowMask);
-+                __m256i w_high_next = _mm256_and_si256(_mm256_srli_epi16(raw_w_next, 4), lowMask);
-                 // TODO: apply zero_point to weights and convert the range from (0, 15) to (-8, 7)
-                 // Hint: using `_mm256_sub_epi8` to the lower-half and upper-half vectors of weights
-                 // Note: For the first two blocks, store the lower half and upper half of weights into `w_0` and
-@@ -133,7 +137,10 @@ static void *all_techniques_worker_func(void *args) {
-                 // `w_0_next` and `w_128_next`, respectively
-                 const __m256i zero_point = _mm256_set1_epi8(8);
-                 __m256i w_0, w_128, w_0_next, w_128_next;
+-                // TODO: apply zero_point to weights and convert the range from (0, 15) to (-8, 7)
+-                // Hint: using `_mm256_sub_epi8` to the lower-half and upper-half vectors of weights
+-                // Note: For the first two blocks, store the lower half and upper half of weights into `w_0` and
+-                // `w_128`, respectively For the last two blocks store the lower half and upper half of weights into
+-                // `w_0_next` and `w_128_next`, respectively
+-                const __m256i zero_point = _mm256_set1_epi8(8);
+-                __m256i w_0, w_128, w_0_next, w_128_next;
 -
-+                w_0 = _mm256_sub_epi8(w_low, zero_point);
-+                w_128 = _mm256_sub_epi8(w_high, zero_point);
-+                w_0_next = _mm256_sub_epi8(w_low_next, zero_point);
-+                w_128_next = _mm256_sub_epi8(w_high_next, zero_point);
++                // Extract low/high 4-bits and apply zero_point in single pass
++                __m256i w_0 = _mm256_sub_epi8(_mm256_and_si256(raw_w, lowMask), zero_point);
++                __m256i w_128 = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(raw_w, 4), lowMask), zero_point);
++                __m256i w_0_next = _mm256_sub_epi8(_mm256_and_si256(raw_w_next, lowMask), zero_point);
++                __m256i w_128_next = _mm256_sub_epi8(_mm256_and_si256(_mm256_srli_epi16(raw_w_next, 4), lowMask), zero_point);
                  // Perform int8 dot product with _mm256_maddubs_epi16
                  /* Syntax of _mm256_maddubs_epi16:
                     __m256i _mm256_maddubs_epi16(__m256i s1, __m256i s2): Multiplies vertically each unsigned byte of
-@@ -169,7 +176,10 @@ static void *all_techniques_worker_func(void *args) {
+@@ -169,34 +164,32 @@ static void *all_techniques_worker_func(void *args) {
                  // dot2 = ax2 * sy2
                  // dot3 = ax_next * sy_next
                  // dot4 = ax2_next * sy2_next
 -
+-                // Convert int32 vectors to floating point vectors
+-                const __m256i ones = _mm256_set1_epi16(1);
+-                const __m256i summed_pairs = _mm256_madd_epi16(ones, dot);
+-                const __m256i summed_pairs2 = _mm256_madd_epi16(ones, dot2);
+-                const __m256i summed_pairs3 = _mm256_madd_epi16(ones, dot3);
+-                const __m256i summed_pairs4 = _mm256_madd_epi16(ones, dot4);
+-                __m256 intermediate = _mm256_cvtepi32_ps(summed_pairs);
+-                __m256 intermediate2 = _mm256_cvtepi32_ps(summed_pairs2);
+-                __m256 intermediate3 = _mm256_cvtepi32_ps(summed_pairs3);
+-                __m256 intermediate4 = _mm256_cvtepi32_ps(summed_pairs4);
+-
+-                // Create vectors for scales and apply them to intermediate results
+-                __m256 v_s = _mm256_set1_ps(s_ptr[0] * sa_ptr[0]);
+-                __m256 v_s2 = _mm256_set1_ps(s_ptr[1] * sa_ptr[1]);
+-                __m256 v_s3 = _mm256_set1_ps(s_ptr[2] * sa_ptr[2]);
+-                __m256 v_s4 = _mm256_set1_ps(s_ptr[3] * sa_ptr[3]);
+-                accumulator = _mm256_fmadd_ps(intermediate, v_s, accumulator);
+-                accumulator = _mm256_fmadd_ps(intermediate2, v_s2, accumulator);
+-                accumulator = _mm256_fmadd_ps(intermediate3, v_s3, accumulator);
+-                accumulator = _mm256_fmadd_ps(intermediate4, v_s4, accumulator);
 +                dot = _mm256_maddubs_epi16(ax, sy);
 +                dot2 = _mm256_maddubs_epi16(ax2, sy2);
 +                dot3 = _mm256_maddubs_epi16(ax_next, sy_next);
 +                dot4 = _mm256_maddubs_epi16(ax2_next, sy2_next);
-                 // Convert int32 vectors to floating point vectors
-                 const __m256i ones = _mm256_set1_epi16(1);
-                 const __m256i summed_pairs = _mm256_madd_epi16(ones, dot);
-@@ -206,7 +216,7 @@ static void *all_techniques_worker_func(void *args) {
++                
++                // Fused horizontal add + scale multiplication (avoid temp variables)
++                float scale0 = s_ptr[0] * sa_ptr[0];
++                float scale1 = s_ptr[1] * sa_ptr[1];
++                float scale2 = s_ptr[2] * sa_ptr[2];
++                float scale3 = s_ptr[3] * sa_ptr[3];
++                
++                accumulator = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot)), _mm256_set1_ps(scale0), accumulator);
++                accumulator = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot2)), _mm256_set1_ps(scale1), accumulator);
++                accumulator = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot3)), _mm256_set1_ps(scale2), accumulator);
++                accumulator = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_madd_epi16(ones, dot4)), _mm256_set1_ps(scale3), accumulator);
+                 s_ptr += 4;
+                 sa_ptr += 4;
+                 w_start += 2;
+                 a_start += 4;
+             }
+-            float *ptr = (float *)&accumulator;
+-            C->data_ptr[row * n + col] = ptr[0] + ptr[1] + ptr[2] + ptr[3] + ptr[4] + ptr[5] + ptr[6] + ptr[7];
++            // Efficient horizontal add using shuffles (faster than array cast + loop)
++            __m256 perm = _mm256_permute2f128_ps(accumulator, accumulator, 1);
++            __m256 sum = _mm256_add_ps(accumulator, perm);
++            sum = _mm256_add_ps(sum, _mm256_shuffle_ps(sum, sum, _MM_SHUFFLE(1, 0, 3, 2)));
++            sum = _mm256_add_ps(sum, _mm256_shuffle_ps(sum, sum, _MM_SHUFFLE(2, 3, 0, 1)));
++            C->data_ptr[row * n + col] = _mm256_cvtss_f32(sum);
+ #endif
+         }
+     }
+@@ -206,7 +199,7 @@ static void *all_techniques_worker_func(void *args) {
  
  namespace matmul {
  void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
@@ -57,7 +113,7 @@ index c902e7e..903025c 100644
      const struct matrix *A = &params->A, *B = &params->B, *C = &params->C;
      const int block_size = params->block_size;
      float *scale = params->scales, *offset = params->offset;
-@@ -222,7 +232,16 @@ void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
+@@ -222,7 +215,16 @@ void MatmulOperator::mat_mul_all_techniques(struct matmul_params *params) {
      assert(params->block_size == 32);  // support block size 32 for now
  
      // TODO: Thread creation
